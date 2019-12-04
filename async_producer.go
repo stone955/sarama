@@ -17,7 +17,6 @@ import (
 // leaks: it will not be garbage-collected automatically when it passes out of
 // scope.
 type AsyncProducer interface {
-
 	// AsyncClose triggers a shutdown of the producer. The shutdown has completed
 	// when both the Errors and Successes channels have been closed. When calling
 	// AsyncClose, you *must* continue to read from those channels in order to
@@ -108,10 +107,13 @@ type asyncProducer struct {
 
 // NewAsyncProducer creates a new AsyncProducer using the given broker addresses and configuration.
 func NewAsyncProducer(addrs []string, conf *Config) (AsyncProducer, error) {
+	// 创建kafka客户端，从broker获取topic的基础元数据及分区元数据
+	// 默认10秒钟更新一次元数据信息
 	client, err := NewClient(addrs, conf)
 	if err != nil {
 		return nil, err
 	}
+	// 用创建的客户端创建生产者
 	return newAsyncProducer(client)
 }
 
@@ -129,7 +131,7 @@ func newAsyncProducer(client Client) (AsyncProducer, error) {
 	if client.Closed() {
 		return nil, ErrClosedClient
 	}
-
+	// 创建事务管理
 	txnmgr, err := newTransactionManager(client.Config(), client)
 	if err != nil {
 		return nil, err

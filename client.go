@@ -126,10 +126,12 @@ type client struct {
 func NewClient(addrs []string, conf *Config) (Client, error) {
 	Logger.Println("Initializing new client")
 
+	// 使用默认配置
 	if conf == nil {
 		conf = NewConfig()
 	}
 
+	// 校验配置项
 	if err := conf.Validate(); err != nil {
 		return nil, err
 	}
@@ -138,6 +140,12 @@ func NewClient(addrs []string, conf *Config) (Client, error) {
 		return nil, ConfigurationError("You must provide at least one broker address")
 	}
 
+	// 初始化客户端
+	// brokers 缓存broker集群信息
+	// metadata 缓存topic的分区信息
+	// metadataTopics 缓存topic信息
+	// cachedPartitionsResults 缓存topic的分区号
+	// TODO coordinators
 	client := &client{
 		conf:                    conf,
 		closer:                  make(chan none),
@@ -149,11 +157,13 @@ func NewClient(addrs []string, conf *Config) (Client, error) {
 		coordinators:            make(map[string]int32),
 	}
 
+	// 对传入的多个broker addr打乱顺序缓存
 	random := rand.New(rand.NewSource(time.Now().UnixNano()))
 	for _, index := range random.Perm(len(addrs)) {
 		client.seedBrokers = append(client.seedBrokers, NewBroker(addrs[index]))
 	}
 
+	// 获取所有的元数据
 	if conf.Metadata.Full {
 		// do an initial fetch of all cluster metadata by specifying an empty list of topics
 		err := client.RefreshMetadata()
@@ -169,6 +179,8 @@ func NewClient(addrs []string, conf *Config) (Client, error) {
 			return nil, err
 		}
 	}
+
+	// 另起一个协程周期更新，实际最终还会调用 client.RefreshMetadata()
 	go withRecover(client.backgroundMetadataUpdater)
 
 	Logger.Println("Successfully initialized new client")
