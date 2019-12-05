@@ -82,6 +82,7 @@ type consumer struct {
 
 // NewConsumer creates a new consumer using the given broker addresses and configuration.
 func NewConsumer(addrs []string, config *Config) (Consumer, error) {
+	// 创建客户端，从broker获取topic元数据及分区信息
 	client, err := NewClient(addrs, config)
 	if err != nil {
 		return nil, err
@@ -104,6 +105,7 @@ func newConsumer(client Client) (Consumer, error) {
 		return nil, ErrClosedClient
 	}
 
+	// 创建消费者，初始化分区消费者partitionConsumer，brokerConsumer
 	c := &consumer{
 		client:          client,
 		conf:            client.Config(),
@@ -122,11 +124,14 @@ func (c *consumer) Topics() ([]string, error) {
 	return c.client.Topics()
 }
 
+// Partitions 返回该topic的所有分区
 func (c *consumer) Partitions(topic string) ([]int32, error) {
 	return c.client.Partitions(topic)
 }
 
+// ConsumePartition 返回分区消费者
 func (c *consumer) ConsumePartition(topic string, partition int32, offset int64) (PartitionConsumer, error) {
+	// 初始化分区消费者，创建一系列的消息管道
 	child := &partitionConsumer{
 		consumer:  c,
 		conf:      c.conf,
@@ -140,16 +145,19 @@ func (c *consumer) ConsumePartition(topic string, partition int32, offset int64)
 		fetchSize: c.conf.Consumer.Fetch.Default,
 	}
 
+	// 设置offset
 	if err := child.chooseStartingOffset(offset); err != nil {
 		return nil, err
 	}
 
+	// 获取该分区的Leader
 	var leader *Broker
 	var err error
 	if leader, err = c.client.Leader(child.topic, child.partition); err != nil {
 		return nil, err
 	}
 
+	// 缓存该分区消费者
 	if err := c.addChild(child); err != nil {
 		return nil, err
 	}
@@ -157,6 +165,7 @@ func (c *consumer) ConsumePartition(topic string, partition int32, offset int64)
 	go withRecover(child.dispatcher)
 	go withRecover(child.responseFeeder)
 
+	// 缓存该分区的Leader
 	child.broker = c.refBrokerConsumer(leader)
 	child.broker.input <- child
 
@@ -378,10 +387,12 @@ func (child *partitionConsumer) dispatch() error {
 }
 
 func (child *partitionConsumer) chooseStartingOffset(offset int64) error {
+	// 获取该分区最新的offset
 	newestOffset, err := child.consumer.client.GetOffset(child.topic, child.partition, OffsetNewest)
 	if err != nil {
 		return err
 	}
+	// 获取该分区最老的offset
 	oldestOffset, err := child.consumer.client.GetOffset(child.topic, child.partition, OffsetOldest)
 	if err != nil {
 		return err
@@ -715,7 +726,9 @@ func (c *consumer) newBrokerConsumer(broker *Broker) *brokerConsumer {
 		refs:             0,
 	}
 
+	// 订阅关系管理协程
 	go withRecover(bc.subscriptionManager)
+	// 消费消息协程
 	go withRecover(bc.subscriptionConsumer)
 
 	return bc
