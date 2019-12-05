@@ -90,10 +90,16 @@ func newTransactionManager(conf *Config, client Client) (*transactionManager, er
 	return txnmgr, nil
 }
 
+// client 创建的客户端
+// conf 生产者配置
+// errors 接收错误消息管道
+// input 接收消息管道
+// successes 接收发送成功消息管道
+// retries 接收重试消息管道
+// txnmgr 事务管理
 type asyncProducer struct {
-	client Client
-	conf   *Config
-
+	client                    Client
+	conf                      *Config
 	errors                    chan *ProducerError
 	input, successes, retries chan *ProducerMessage
 	inFlight                  sync.WaitGroup
@@ -106,6 +112,11 @@ type asyncProducer struct {
 }
 
 // NewAsyncProducer creates a new AsyncProducer using the given broker addresses and configuration.
+// NewAsyncProducer 创建生产者，内部创建了以下几个核心的角色
+// 1.client 客户端，从broker获取topic元数据，及获取分区的Leader
+// 2.asyncProducer 消息生产者，内部创建topic对应的生产者topicProducer，通过input 管道传递消息
+// 3.topicProducer 主题生产者，内部创建该主题分区对应的分区生产者partitionProducer，通过input管道传递消息
+// 4.partitionProducer 分区生产者，内部创建brokerProducer，真正发送消息的角色，通过input管道传递消息
 func NewAsyncProducer(addrs []string, conf *Config) (AsyncProducer, error) {
 	// 创建kafka客户端，从broker获取topic的基础元数据及分区元数据
 	// 默认10秒钟更新一次元数据信息
@@ -137,6 +148,8 @@ func newAsyncProducer(client Client) (AsyncProducer, error) {
 		return nil, err
 	}
 
+	// 创建同步/异步生产者，具体是同步还是异步，由conf决定
+	// 创建生产者时，主要是初始化一系列接收各种消息的管道
 	p := &asyncProducer{
 		client:     client,
 		conf:       client.Config(),
@@ -149,6 +162,7 @@ func newAsyncProducer(client Client) (AsyncProducer, error) {
 		txnmgr:     txnmgr,
 	}
 
+	// 启动两个协程，分别是发送消息的协程与重试协程
 	// launch our singleton dispatchers
 	go withRecover(p.dispatcher)
 	go withRecover(p.retryHandler)
@@ -302,9 +316,11 @@ func (p *asyncProducer) AsyncClose() {
 // singleton
 // dispatches messages by topic
 func (p *asyncProducer) dispatcher() {
+	// 声明一个map类型的handlers，key为topic value为对应topic生产者的消息管道
 	handlers := make(map[string]chan<- *ProducerMessage)
 	shuttingDown := false
 
+	// 监听input管道，处理待发送的消息
 	for msg := range p.input {
 		if msg == nil {
 			Logger.Println("Something tried to send a nil message, it was ignored.")
@@ -316,6 +332,7 @@ func (p *asyncProducer) dispatcher() {
 			p.inFlight.Done()
 			continue
 		} else if msg.retries == 0 {
+			// 生产者已经关闭，则返回错误消息，并投递到管道errors
 			if shuttingDown {
 				// we can't just call returnError here because that decrements the wait group,
 				// which hasn't been incremented yet for this message, and shouldn't be
@@ -330,6 +347,7 @@ func (p *asyncProducer) dispatcher() {
 			p.inFlight.Add(1)
 		}
 
+		// 校验
 		version := 1
 		if p.conf.Version.IsAtLeast(V0_11_0_0) {
 			version = 2
@@ -342,15 +360,18 @@ func (p *asyncProducer) dispatcher() {
 			continue
 		}
 
+		// 返回或创建一个topic生产者管道
 		handler := handlers[msg.Topic]
 		if handler == nil {
 			handler = p.newTopicProducer(msg.Topic)
 			handlers[msg.Topic] = handler
 		}
 
+		// 投递消息
 		handler <- msg
 	}
 
+	// 当循环退出即生产者关闭时，也关闭相应的管道，防止内存泄漏
 	for _, handler := range handlers {
 		close(handler)
 	}
@@ -358,6 +379,11 @@ func (p *asyncProducer) dispatcher() {
 
 // one per topic
 // partitions messages, then dispatches them by partition
+// 每一个topic对应一个生产者，内部持有该topic下分区的消息管道，最终粒度其实是分区的生产者
+// topic 消息主题
+// input 该消息主题生产者接收消息管道
+// handlers 该topic下每个分区的接收消息管道
+// partitioner 分区函数，返回分区号
 type topicProducer struct {
 	parent *asyncProducer
 	topic  string
@@ -369,6 +395,7 @@ type topicProducer struct {
 }
 
 func (p *asyncProducer) newTopicProducer(topic string) chan<- *ProducerMessage {
+	// 创建一个有缓冲的消息管道，默认缓冲区为256
 	input := make(chan *ProducerMessage, p.conf.ChannelBufferSize)
 	tp := &topicProducer{
 		parent:      p,
@@ -378,6 +405,7 @@ func (p *asyncProducer) newTopicProducer(topic string) chan<- *ProducerMessage {
 		handlers:    make(map[int32]chan<- *ProducerMessage),
 		partitioner: p.conf.Producer.Partitioner(topic),
 	}
+	// 另起一个协程运行topicProducer
 	go withRecover(tp.dispatch)
 	return input
 }
@@ -395,6 +423,7 @@ func (tp *topicProducer) dispatch() {
 			msg.sequenceNumber = tp.parent.txnmgr.getAndIncrementSequenceNumber(msg.Topic, msg.Partition)
 		}
 
+		// 返回或创建对应分区的生产者管道
 		handler := tp.handlers[msg.Partition]
 		if handler == nil {
 			handler = tp.parent.newPartitionProducer(msg.Topic, msg.Partition)
@@ -404,6 +433,7 @@ func (tp *topicProducer) dispatch() {
 		handler <- msg
 	}
 
+	// 关闭管道
 	for _, handler := range tp.handlers {
 		close(handler)
 	}
@@ -505,9 +535,11 @@ func (pp *partitionProducer) backoff(retries int) {
 	}
 }
 
+// dispatch 发送消息的核心方法
 func (pp *partitionProducer) dispatch() {
 	// try to prefetch the leader; if this doesn't work, we'll do a proper call to `updateLeader`
 	// on the first message
+	// 获取该分区的Leader broker
 	pp.leader, _ = pp.parent.client.Leader(pp.topic, pp.partition)
 	if pp.leader != nil {
 		pp.brokerProducer = pp.parent.getBrokerProducer(pp.leader)
@@ -1016,6 +1048,7 @@ func (p *asyncProducer) retryHandler() {
 func (p *asyncProducer) shutdown() {
 	Logger.Println("Producer shutting down.")
 	p.inFlight.Add(1)
+	// 发送一个关闭消息
 	p.input <- &ProducerMessage{flags: shutdown}
 
 	p.inFlight.Wait()
