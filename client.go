@@ -145,7 +145,7 @@ func NewClient(addrs []string, conf *Config) (Client, error) {
 	// metadata 缓存topic的分区信息
 	// metadataTopics 缓存topic信息
 	// cachedPartitionsResults 缓存topic的分区号
-	// TODO coordinators
+	// coordinators 缓存消费者组
 	client := &client{
 		conf:                    conf,
 		closer:                  make(chan none),
@@ -436,6 +436,7 @@ func (client *client) Leader(topic string, partitionID int32) (*Broker, error) {
 	return leader, err
 }
 
+// RefreshMetadata 更新元数据，通过从broker获取topic元数据，更新客户端持有的元数据缓存
 func (client *client) RefreshMetadata(topics ...string) error {
 	if client.Closed() {
 		return ErrClosedClient
@@ -444,12 +445,14 @@ func (client *client) RefreshMetadata(topics ...string) error {
 	// Prior to 0.8.2, Kafka will throw exceptions on an empty topic and not return a proper
 	// error. This handles the case by returning an error instead of sending it
 	// off to Kafka. See: https://github.com/Shopify/sarama/pull/38#issuecomment-26362310
+	// 创建客户端时不会传入topics，但是可以直接调用RefreshMetadata更新指定topic的信息
 	for _, topic := range topics {
 		if len(topic) == 0 {
 			return ErrInvalidTopic // this is the error that 0.8.2 and later correctly return
 		}
 	}
 
+	// 设置获取元数据的超时时间
 	deadline := time.Time{}
 	if client.conf.Metadata.Timeout > 0 {
 		deadline = time.Now().Add(client.conf.Metadata.Timeout)
@@ -761,7 +764,9 @@ func (client *client) refreshMetadata() error {
 	return nil
 }
 
+// tryRefreshMetadata 客户端更新元数据的核心方法
 func (client *client) tryRefreshMetadata(topics []string, attemptsRemaining int, deadline time.Time) error {
+	// 声明一个判断是否超时的函数
 	pastDeadline := func(backoff time.Duration) bool {
 		if !deadline.IsZero() && time.Now().Add(backoff).After(deadline) {
 			// we are past the deadline
@@ -769,6 +774,7 @@ func (client *client) tryRefreshMetadata(topics []string, attemptsRemaining int,
 		}
 		return false
 	}
+	// 重试函数，重试间隔时间会重新调用tryRefreshMetadata函数
 	retry := func(err error) error {
 		if attemptsRemaining > 0 {
 			backoff := client.computeBackoff(attemptsRemaining)
@@ -785,6 +791,7 @@ func (client *client) tryRefreshMetadata(topics []string, attemptsRemaining int,
 		return err
 	}
 
+	// 获取一个broker建立连接，获取元数据
 	broker := client.any()
 	for ; broker != nil && !pastDeadline(0); broker = client.any() {
 		allowAutoTopicCreation := true
@@ -795,17 +802,21 @@ func (client *client) tryRefreshMetadata(topics []string, attemptsRemaining int,
 			Logger.Printf("client/metadata fetching metadata for all topics from broker %s\n", broker.addr)
 		}
 
+		// 创建获取元数据的请求结构体
 		req := &MetadataRequest{Topics: topics, AllowAutoTopicCreation: allowAutoTopicCreation}
 		if client.conf.Version.IsAtLeast(V1_0_0_0) {
 			req.Version = 5
 		} else if client.conf.Version.IsAtLeast(V0_10_0_0) {
 			req.Version = 1
 		}
+		// 从broker获取元数据
 		response, err := broker.GetMetadata(req)
 		switch err.(type) {
 		case nil:
 			allKnownMetaData := len(topics) == 0
 			// valid response, use it
+			// 获取到元数据，则更新客户端缓存，更新缓存成功，则函数直接返回，此时err is nil
+			// updateMetadata 会更新客户端缓存的metadata、metadataTopics、cachedPartitionsResults
 			shouldRetry, err := client.updateMetadata(response, allKnownMetaData)
 			if shouldRetry {
 				Logger.Println("client/metadata found some partitions to be leaderless")
@@ -813,10 +824,13 @@ func (client *client) tryRefreshMetadata(topics []string, attemptsRemaining int,
 			}
 			return err
 
+			// 报文编码失败，此时请求未发送到broker，不需要重试，直接返回错误
 		case PacketEncodingError:
 			// didn't even send, return the error
 			return err
 
+			// 服务端返回的错误，如果是权限验证错误，则不重试，直接返回错误信息
+			// 其它错误表名broker异常，则从客户端移除broker，接下来将从下一个broker获取元数据信息
 		case KError:
 			// if SASL auth error return as this _should_ be a non retryable err for all brokers
 			if err.(KError) == ErrSASLAuthenticationFailed {
@@ -833,6 +847,7 @@ func (client *client) tryRefreshMetadata(topics []string, attemptsRemaining int,
 			_ = broker.Close()
 			client.deregisterBroker(broker)
 
+			// 其它错误表名broker异常，则从客户端移除broker，接下来将从下一个broker获取元数据信息
 		default:
 			// some other error, remove that broker and try again
 			Logger.Printf("client/metadata got error from broker %d while fetching metadata: %v\n", broker.ID(), err)
@@ -841,6 +856,8 @@ func (client *client) tryRefreshMetadata(topics []string, attemptsRemaining int,
 		}
 	}
 
+	// 如果成功从broker获取到元数据信息，则不会走到这里
+	// 走到这里，说明传入的broker集群均获取失败，则进行重试
 	if broker != nil {
 		Logger.Printf("client/metadata not fetching metadata from broker %s as we would go past the metadata timeout\n", broker.addr)
 		return retry(ErrOutOfBrokers)
