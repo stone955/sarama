@@ -141,7 +141,7 @@ func NewClient(addrs []string, conf *Config) (Client, error) {
 	}
 
 	// 初始化客户端
-	// brokers 缓存broker集群信息
+	// brokers 缓存broker信息
 	// metadata 缓存topic的分区信息
 	// metadataTopics 缓存topic信息
 	// cachedPartitionsResults 缓存topic的分区号
@@ -158,6 +158,7 @@ func NewClient(addrs []string, conf *Config) (Client, error) {
 	}
 
 	// 对传入的多个broker addr打乱顺序缓存
+	// 此处使用当前时间戳作为随机数生成的种子，可以在自己的代码中借鉴
 	random := rand.New(rand.NewSource(time.Now().UnixNano()))
 	for _, index := range random.Perm(len(addrs)) {
 		client.seedBrokers = append(client.seedBrokers, NewBroker(addrs[index]))
@@ -502,13 +503,16 @@ func (client *client) Controller() (*Broker, error) {
 	return controller, nil
 }
 
+// Coordinator 获取消费者组的协调者Broker
 func (client *client) Coordinator(consumerGroup string) (*Broker, error) {
 	if client.Closed() {
 		return nil, ErrClosedClient
 	}
 
+	// 从缓存中获取
 	coordinator := client.cachedCoordinator(consumerGroup)
 
+	// 缓存中如果没有就重新获取并加入到缓存中
 	if coordinator == nil {
 		if err := client.RefreshCoordinator(consumerGroup); err != nil {
 			return nil, err
@@ -519,7 +523,7 @@ func (client *client) Coordinator(consumerGroup string) (*Broker, error) {
 	if coordinator == nil {
 		return nil, ErrConsumerCoordinatorNotAvailable
 	}
-
+	// 如果客户端之前没有与该broker建立连接或连接断开，此处还会尝试建立一次连接
 	_ = coordinator.Open(client.conf)
 	return coordinator, nil
 }
@@ -529,6 +533,7 @@ func (client *client) RefreshCoordinator(consumerGroup string) error {
 		return ErrClosedClient
 	}
 
+	// 获取消费者元数据
 	response, err := client.getConsumerMetadata(consumerGroup, client.conf.Metadata.Retry.Max)
 	if err != nil {
 		return err
@@ -536,6 +541,7 @@ func (client *client) RefreshCoordinator(consumerGroup string) error {
 
 	client.lock.Lock()
 	defer client.lock.Unlock()
+	// 缓存当前消费者组的协调者broker
 	client.registerBroker(response.Coordinator)
 	client.coordinators[consumerGroup] = response.Coordinator.ID()
 	return nil
@@ -569,7 +575,9 @@ func (client *client) deregisterBroker(broker *Broker) {
 	defer client.lock.Unlock()
 
 	if len(client.seedBrokers) > 0 && broker == client.seedBrokers[0] {
+		// 将当前broker加入deadSeeds
 		client.deadSeeds = append(client.deadSeeds, broker)
+		// 从seedBrokers移除
 		client.seedBrokers = client.seedBrokers[1:]
 	} else {
 		// we do this so that our loop in `tryRefreshMetadata` doesn't go on forever,
@@ -594,6 +602,7 @@ func (client *client) any() *Broker {
 	client.lock.RLock()
 	defer client.lock.RUnlock()
 
+	// seedBrokers 是已经打乱顺序的broker, 因此直接取第一个broker建立连接，
 	if len(client.seedBrokers) > 0 {
 		_ = client.seedBrokers[0].Open(client.conf)
 		return client.seedBrokers[0]
@@ -844,7 +853,9 @@ func (client *client) tryRefreshMetadata(topics []string, attemptsRemaining int,
 			}
 			// else remove that broker and try again
 			Logger.Printf("client/metadata got error from broker %d while fetching metadata: %v\n", broker.ID(), err)
+			// 关闭与该broker的连接
 			_ = broker.Close()
+			// 从客户端缓存的seedBrokers中移除该broker
 			client.deregisterBroker(broker)
 
 			// 其它错误表名broker异常，则从客户端移除broker，接下来将从下一个broker获取元数据信息
@@ -864,6 +875,7 @@ func (client *client) tryRefreshMetadata(topics []string, attemptsRemaining int,
 	}
 
 	Logger.Println("client/metadata no available broker to send metadata request to")
+	// 将deedSeeds的brokers重新加入到seedBrokers 供下一个周期使用
 	client.resurrectDeadBrokers()
 	return retry(ErrOutOfBrokers)
 }
@@ -881,6 +893,8 @@ func (client *client) updateMetadata(data *MetadataResponse, allKnownMetaData bo
 	// - if it is a new ID, save it
 	// - if it is an existing ID, but the address we have is stale, discard the old one and save it
 	// - otherwise ignore it, replacing our existing one would just bounce the connection
+	// data中会携带集群中所有的broker 将这些broker缓存到client已经持有的brokers
+	// 如果client已经持有该broker则不缓存
 	for _, broker := range data.Brokers {
 		client.registerBroker(broker)
 	}
@@ -980,8 +994,10 @@ func (client *client) getConsumerMetadata(consumerGroup string, attemptsRemainin
 		request.CoordinatorKey = consumerGroup
 		request.CoordinatorType = CoordinatorGroup
 
+		// 随机向其中一个broker发起请求，获取该消费者组的协调者broker
 		response, err := broker.FindCoordinator(request)
 
+		// 返回异常或重试
 		if err != nil {
 			Logger.Printf("client/coordinator request to broker %s failed: %s\n", broker.Addr(), err)
 
@@ -996,16 +1012,19 @@ func (client *client) getConsumerMetadata(consumerGroup string, attemptsRemainin
 		}
 
 		switch response.Err {
+		// 获取成功
 		case ErrNoError:
 			Logger.Printf("client/coordinator coordinator for consumergroup %s is #%d (%s)\n", consumerGroup, response.Coordinator.ID(), response.Coordinator.Addr())
 			return response, nil
-
+		// 该消费者组的协调者不可用
 		case ErrConsumerCoordinatorNotAvailable:
 			Logger.Printf("client/coordinator coordinator for consumer group %s is not available\n", consumerGroup)
 
 			// This is very ugly, but this scenario will only happen once per cluster.
 			// The __consumer_offsets topic only has to be created one time.
 			// The number of partitions not configurable, but partition 0 should always exist.
+			// __consumer_offsets肯定在一开始就会创建
+			// 一个主题至少会有一个分区，即0分区
 			if _, err := client.Leader("__consumer_offsets", 0); err != nil {
 				Logger.Printf("client/coordinator the __consumer_offsets topic is not initialized completely yet. Waiting 2 seconds...\n")
 				time.Sleep(2 * time.Second)

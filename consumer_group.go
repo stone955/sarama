@@ -38,6 +38,7 @@ type ConsumerGroup interface {
 	// as quickly as possible to allow time for Cleanup() and the final offset commit. If the timeout
 	// is exceeded, the consumer will be removed from the group by Kafka, which will cause offset
 	// commit failures.
+	// Consume 客户端作为一个消费者组的成员加入到消费者组中，可能会触发rebalance
 	Consume(ctx context.Context, topics []string, handler ConsumerGroupHandler) error
 
 	// Errors returns a read channel of errors that occurred during the consumer life-cycle.
@@ -69,13 +70,18 @@ type consumerGroup struct {
 
 // NewConsumerGroup creates a new consumer group the given broker addresses and configuration.
 func NewConsumerGroup(addrs []string, groupID string, config *Config) (ConsumerGroup, error) {
+	// 创建客户端从broker获取元数据进而与broker建立连接
+	// 创建成功会启动周期线程从broker获取最新的元数据
+	// 如果broker异常，会重连
 	client, err := NewClient(addrs, config)
 	if err != nil {
 		return nil, err
 	}
 
+	// 使用已创建的客户端创建消费者组
 	c, err := newConsumerGroup(groupID, client)
 	if err != nil {
+		// 创建消费者组失败会将客户端与broker彻底断开连接
 		_ = client.Close()
 	}
 	return c, err
@@ -97,6 +103,9 @@ func newConsumerGroup(groupID string, client Client) (ConsumerGroup, error) {
 		return nil, ConfigurationError("consumer groups require Version to be >= V0_10_2_0")
 	}
 
+	// 使用已创建的客户端创建消费者
+	// 实际创建的是consumer结构体
+	// 内部包括map[string]map[int32]*partitionConsumer与map[*Broker]*brokerConsumer
 	consumer, err := NewConsumerFromClient(client)
 	if err != nil {
 		return nil, err
@@ -161,11 +170,15 @@ func (c *consumerGroup) Consume(ctx context.Context, topics []string, handler Co
 	}
 
 	// Refresh metadata for requested topics
+	// 此处会从broker更新一次指定主题的元数据
+	// 当然也相当于与broker做了一个连接检查及重连操作
+	// 不同于创建客户端时获取元数据的是，此时只获取指定消费主题的元数据，其它主题的元数据不更新
 	if err := c.client.RefreshMetadata(topics...); err != nil {
 		return err
 	}
 
 	// Init session
+	// 初始化一个Session
 	sess, err := c.newSession(ctx, topics, handler, c.config.Consumer.Group.Rebalance.Retry.Max)
 	if err == ErrClosedClient {
 		return ErrClosedConsumerGroup
@@ -202,16 +215,18 @@ func (c *consumerGroup) retryNewSession(ctx context.Context, topics []string, ha
 }
 
 func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler ConsumerGroupHandler, retries int) (*consumerGroupSession, error) {
+	// 获取当前消费者组的协调者是哪个broker
 	coordinator, err := c.client.Coordinator(c.groupID)
 	if err != nil {
 		if retries <= 0 {
 			return nil, err
 		}
-
+		// 如果首次获取失败会进行重试
 		return c.retryNewSession(ctx, topics, handler, retries, true)
 	}
 
 	// Join consumer group
+	// 当前客户端向该消费者组的协调者broker发出申请，尝试加入消费者组
 	join, err := c.joinGroupRequest(coordinator, topics)
 	if err != nil {
 		_ = coordinator.Close()
@@ -229,6 +244,7 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 		}
 
 		return c.retryNewSession(ctx, topics, handler, retries, true)
+		// 正在rebalance等待重试
 	case ErrRebalanceInProgress: // retry after backoff
 		if retries <= 0 {
 			return nil, join.Err
@@ -240,6 +256,8 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 	}
 
 	// Prepare distribution plan if we joined as the leader
+	// 此处加入消费者组成功
+	// TODO
 	var plan BalanceStrategyPlan
 	if join.LeaderId == join.MemberId {
 		members, err := join.GetMembers()
