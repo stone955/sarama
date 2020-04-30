@@ -179,6 +179,7 @@ func (c *consumerGroup) Consume(ctx context.Context, topics []string, handler Co
 
 	// Init session
 	// 初始化一个Session
+	// newSession可能会失败，此时Consume函数会直接返回error，应用用户保证Consume的重试
 	sess, err := c.newSession(ctx, topics, handler, c.config.Consumer.Group.Rebalance.Retry.Max)
 	if err == ErrClosedClient {
 		return ErrClosedConsumerGroup
@@ -226,30 +227,34 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 	}
 
 	// Join consumer group
-	// 当前客户端向该消费者组的协调者broker发出申请，尝试加入消费者组
+	// 当前客户端向该消费者组的coordinator发出申请，尝试加入消费者组
+	// 如果err != nil 是请求coordinator失败，则断开coordinator连接
 	join, err := c.joinGroupRequest(coordinator, topics)
 	if err != nil {
 		_ = coordinator.Close()
 		return nil, err
 	}
+	// 请求coordinator成功，则根据coordinator给出的回执决定后续处理
 	switch join.Err {
 	case ErrNoError:
+		// 响应无异常，将客户端的memberID更新成coordinator生成的memberID
 		c.memberID = join.MemberId
 	case ErrUnknownMemberId, ErrIllegalGeneration: // reset member ID and retry immediately
+		// ErrUnknownMemberId,ErrIllegalGeneration 立刻重试 但是重试基本上也是一直失败的
 		c.memberID = ""
 		return c.newSession(ctx, topics, handler, retries)
 	case ErrNotCoordinatorForConsumer: // retry after backoff with coordinator refresh
 		if retries <= 0 {
 			return nil, join.Err
 		}
-
+		// ErrNotCoordinatorForConsumer 换一个coordinator重试
 		return c.retryNewSession(ctx, topics, handler, retries, true)
 		// 正在rebalance等待重试
 	case ErrRebalanceInProgress: // retry after backoff
 		if retries <= 0 {
 			return nil, join.Err
 		}
-
+		// ErrRebalanceInProgress 正在进行均衡，换一个coordinator重试
 		return c.retryNewSession(ctx, topics, handler, retries, false)
 	default:
 		return nil, join.Err
@@ -257,14 +262,15 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 
 	// Prepare distribution plan if we joined as the leader
 	// 此处加入消费者组成功
-	// TODO
 	var plan BalanceStrategyPlan
+	// 当前客户端是该消费者组的Leader
 	if join.LeaderId == join.MemberId {
+		// 获取所有的members
 		members, err := join.GetMembers()
 		if err != nil {
 			return nil, err
 		}
-
+		// 由Leader发起均衡，具体的均衡策略由配置的BalanceStrategyPlan决定，返回的是具体的Plan
 		plan, err = c.balance(members)
 		if err != nil {
 			return nil, err
@@ -272,13 +278,16 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 	}
 
 	// Sync consumer group
+	// 将Leader计算后的Plan发送到coordinator
 	sync, err := c.syncGroupRequest(coordinator, plan, join.GenerationId)
+	// 发送失败返回err并断开与coordinator的连接
 	if err != nil {
 		_ = coordinator.Close()
 		return nil, err
 	}
+	// 处理响应
 	switch sync.Err {
-	case ErrNoError:
+	case ErrNoError: // 没异常，什么都不做
 	case ErrUnknownMemberId, ErrIllegalGeneration: // reset member ID and retry immediately
 		c.memberID = ""
 		return c.newSession(ctx, topics, handler, retries)
@@ -299,7 +308,7 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 	}
 
 	// Retrieve and sort claims
-	var claims map[string][]int32
+	var claims map[string][]int32 // 主题 -> 分区
 	if len(sync.MemberAssignment) > 0 {
 		members, err := sync.GetMemberAssignment()
 		if err != nil {
@@ -312,7 +321,7 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 			sort.Sort(int32Slice(partitions))
 		}
 	}
-
+	// 用coordinator返回的均衡结果监听主题和分区
 	return newConsumerGroupSession(ctx, c, claims, join.MemberId, join.GenerationId, handler)
 }
 
@@ -569,6 +578,8 @@ type consumerGroupSession struct {
 
 func newConsumerGroupSession(ctx context.Context, parent *consumerGroup, claims map[string][]int32, memberID string, generationID int32, handler ConsumerGroupHandler) (*consumerGroupSession, error) {
 	// init offset manager
+	// Coordinator 是按照group管理消费者的
+	// 消费者也应该按group建立，即一个group不管消费几个主题，只建立一个client和一个offsetManager
 	offsets, err := newOffsetManagerFromClient(parent.groupID, memberID, generationID, parent.client)
 	if err != nil {
 		return nil, err
@@ -592,18 +603,22 @@ func newConsumerGroupSession(ctx context.Context, parent *consumerGroup, claims 
 	}
 
 	// start heartbeat loop
+	// 启动心跳线程
 	go sess.heartbeatLoop()
 
+	// 创建各分区管理者，需要按照主题、分区维度，为每个分区建立一个PartitionOffsetManager
 	// create a POM for each claim
 	for topic, partitions := range claims {
 		for _, partition := range partitions {
 			pom, err := offsets.ManagePartition(topic, partition)
 			if err != nil {
+				// 关闭连接
 				_ = sess.release(false)
 				return nil, err
 			}
 
 			// handle POM errors
+			// 处理异常
 			go func(topic string, partition int32) {
 				for err := range pom.Errors() {
 					sess.parent.handleError(err, topic, partition)
@@ -613,12 +628,14 @@ func newConsumerGroupSession(ctx context.Context, parent *consumerGroup, claims 
 	}
 
 	// perform setup
+	// 回调Handler的Setup函数
 	if err := handler.Setup(sess); err != nil {
 		_ = sess.release(true)
 		return nil, err
 	}
 
 	// start consuming
+	// 开始消费消息
 	for topic, partitions := range claims {
 		for _, partition := range partitions {
 			sess.waitGroup.Add(1)
